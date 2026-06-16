@@ -26,9 +26,14 @@ def get_tweet_analyses_collection() -> Collection:
     return get_db()[config.mongo_collection_tweet_analyses]
 
 
+def get_analytics_state_collection() -> Collection:
+    return get_db()[config.mongo_collection_analytics_state]
+
+
 def ensure_indexes(db: Database) -> None:
     tweets = db[config.mongo_collection_tweets]
     tweets.create_index([('_analytics.status', ASCENDING)], name='idx_tweets_analytics_status')
+    tweets.create_index([('_analytics.updated_at', ASCENDING)], name='idx_tweets_analytics_updated_at')
     tweets.create_index([('created_at', DESCENDING)], name='idx_tweets_created_at_desc')
 
     analyses = db[config.mongo_collection_tweet_analyses]
@@ -40,6 +45,9 @@ def ensure_indexes(db: Database) -> None:
     analyses.create_index([('tags_th', ASCENDING)], name='idx_analysis_tags_th')
     analyses.create_index([('tier_key', ASCENDING), ('final_score', DESCENDING)], name='idx_analysis_tier_score')
     analyses.create_index([('final_score', DESCENDING)], name='idx_analysis_final_score_desc')
+
+    state = db[config.mongo_collection_analytics_state]
+    state.create_index([('updated_at', DESCENDING)], name='idx_state_updated_at_desc')
 
 
 def close_mongo() -> None:

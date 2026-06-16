@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
 from pymongo import UpdateOne
 
 from .config import config
-from .mongo import get_tweet_analyses_collection, get_tweets_collection
+from .mongo import (
+    get_analytics_state_collection,
+    get_tweet_analyses_collection,
+    get_tweets_collection,
+)
 
 ANALYSIS_VERSION = 1
+STATE_ID = 'main'
 CATEGORIES = [
     'transfer',
     'injury',
@@ -42,6 +48,22 @@ def safe_string_array(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+def update_state(payload: dict[str, Any]) -> None:
+    state = get_analytics_state_collection()
+    state.update_one(
+        {'_id': STATE_ID},
+        {
+            '$set': {
+                **payload,
+                'service': 'manutd-x-analytics-service-python',
+                'updated_at': now_utc(),
+            },
+            '$setOnInsert': {'created_at': now_utc()},
+        },
+        upsert=True,
+    )
 
 
 def output_text_from_response(response: dict[str, Any]) -> str:
@@ -187,21 +209,69 @@ def call_openai(tweets: list[dict[str, Any]]) -> dict[str, Any]:
     return json.loads(output_text)
 
 
-def load_tweets_for_analysis(limit: int) -> list[dict[str, Any]]:
-    tweets = get_tweets_collection()
-    if config.retry_failed:
-        analytics_filter: dict[str, Any] = {'$nin': ['done', 'pending']}
-    else:
-        analytics_filter = {'$exists': False}
+def eligible_tweet_query() -> dict[str, Any]:
+    pending_cutoff = now_utc() - timedelta(minutes=config.analytics_pending_timeout_minutes)
 
-    query = {
+    status_conditions: list[dict[str, Any]] = [
+        {'_analytics.status': {'$exists': False}},
+        {
+            '_analytics.status': 'pending',
+            '_analytics.updated_at': {'$lt': pending_cutoff},
+        },
+    ]
+
+    if config.retry_failed:
+        status_conditions.append({'_analytics.status': {'$nin': ['done', 'pending']}})
+
+    return {
+        'id': {'$exists': True, '$type': 'string', '$ne': ''},
         'text': {'$exists': True, '$type': 'string', '$ne': ''},
-        '$or': [
-            {'_analytics.status': {'$exists': False}},
-            {'_analytics.status': analytics_filter},
-        ],
+        '$or': status_conditions,
     }
-    return list(tweets.find(query).sort('created_at', -1).limit(limit))
+
+
+def load_tweets_for_analysis(limit: int) -> list[dict[str, Any]]:
+    tweets_collection = get_tweets_collection()
+    analyses_collection = get_tweet_analyses_collection()
+
+    # Clean old documents that already have an analysis but were not marked as done yet.
+    # This prevents repeat billing if a previous version wrote tweet_analyses but did not set tweet state.
+    attempts = 0
+    while attempts < 5:
+        attempts += 1
+        candidates = list(
+            tweets_collection.find(eligible_tweet_query())
+            .sort('created_at', -1)
+            .limit(max(limit * 3, limit))
+        )
+        if not candidates:
+            return []
+
+        candidate_ids = [tweet.get('id') for tweet in candidates if tweet.get('id')]
+        analyzed_ids = set(
+            doc['tweet_id']
+            for doc in analyses_collection.find(
+                {'tweet_id': {'$in': candidate_ids}},
+                {'tweet_id': 1, '_id': 0},
+            )
+            if doc.get('tweet_id')
+        )
+
+        if analyzed_ids:
+            tweets_collection.update_many(
+                {'id': {'$in': list(analyzed_ids)}},
+                {'$set': {'_analytics.status': 'done', '_analytics.analyzed_at': now_utc(), '_analytics.updated_at': now_utc()}},
+            )
+
+        pending = [tweet for tweet in candidates if tweet.get('id') not in analyzed_ids]
+        if pending:
+            return pending[:limit]
+
+    return []
+
+
+def count_pending_tweets() -> int:
+    return get_tweets_collection().count_documents(eligible_tweet_query())
 
 
 def build_analysis_doc(tweet: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
@@ -259,11 +329,27 @@ def run_analytics_once() -> int:
         return 0
 
     tweet_ids = [tweet.get('id') for tweet in tweets if tweet.get('id')]
+    batch_started_at = now_utc()
     print(f'[analytics] Analyzing {len(tweets)} tweet(s)...', flush=True)
 
     tweets_collection.update_many(
         {'id': {'$in': tweet_ids}},
-        {'$set': {'_analytics.status': 'pending'}},
+        {
+            '$set': {
+                '_analytics.status': 'pending',
+                '_analytics.started_at': batch_started_at,
+                '_analytics.updated_at': batch_started_at,
+            }
+        },
+    )
+
+    update_state(
+        {
+            'status': 'running_batch',
+            'current_batch_size': len(tweet_ids),
+            'current_batch_tweet_ids': tweet_ids,
+            'current_batch_started_at': batch_started_at,
+        }
     )
 
     try:
@@ -290,17 +376,120 @@ def run_analytics_once() -> int:
         analyses_collection.bulk_write(operations, ordered=False)
 
         analyzed_ids = [doc['tweet_id'] for doc in docs]
+        finished_at = now_utc()
         tweets_collection.update_many(
             {'id': {'$in': analyzed_ids}},
-            {'$set': {'_analytics.status': 'done', '_analytics.analyzed_at': now_utc()}},
+            {
+                '$set': {
+                    '_analytics.status': 'done',
+                    '_analytics.analyzed_at': finished_at,
+                    '_analytics.updated_at': finished_at,
+                },
+                '$unset': {'_analytics.error': ''},
+            },
+        )
+
+        missing_ids = [tweet_id for tweet_id in tweet_ids if tweet_id not in analyzed_ids]
+        if missing_ids:
+            tweets_collection.update_many(
+                {'id': {'$in': missing_ids}},
+                {
+                    '$set': {
+                        '_analytics.status': 'failed',
+                        '_analytics.error': 'Model returned no matching analysis item for this tweet.',
+                        '_analytics.updated_at': finished_at,
+                    }
+                },
+            )
+
+        update_state(
+            {
+                'status': 'batch_done',
+                'last_batch_analyzed': len(docs),
+                'last_batch_finished_at': finished_at,
+                'last_error': None,
+            }
         )
 
         print(f'[analytics] Done. analyzed={len(docs)}', flush=True)
         return len(docs)
     except Exception as exc:
         message = str(exc)
+        failed_at = now_utc()
         tweets_collection.update_many(
             {'id': {'$in': tweet_ids}},
-            {'$set': {'_analytics.status': 'failed', '_analytics.error': message}},
+            {
+                '$set': {
+                    '_analytics.status': 'failed',
+                    '_analytics.error': message,
+                    '_analytics.updated_at': failed_at,
+                }
+            },
+        )
+        update_state(
+            {
+                'status': 'batch_failed',
+                'last_error': message,
+                'last_failed_at': failed_at,
+            }
         )
         raise
+
+
+def run_analytics_cycle() -> int:
+    total_analyzed = 0
+    batches = 0
+    cycle_started_at = now_utc()
+
+    update_state(
+        {
+            'status': 'running_cycle',
+            'cycle_started_at': cycle_started_at,
+            'cycle_total_analyzed': 0,
+            'cycle_batches': 0,
+            'pending_before_cycle': count_pending_tweets(),
+        }
+    )
+
+    while True:
+        if config.analytics_max_batches_per_cycle and batches >= config.analytics_max_batches_per_cycle:
+            print(
+                f'[analytics] Max batches per cycle reached: {config.analytics_max_batches_per_cycle}',
+                flush=True,
+            )
+            break
+
+        analyzed = run_analytics_once()
+        if analyzed <= 0:
+            break
+
+        total_analyzed += analyzed
+        batches += 1
+        update_state(
+            {
+                'status': 'running_cycle',
+                'cycle_total_analyzed': total_analyzed,
+                'cycle_batches': batches,
+            }
+        )
+
+        if config.analytics_sleep_between_batches_ms > 0:
+            time.sleep(config.analytics_sleep_between_batches_ms / 1000)
+
+    finished_at = now_utc()
+    pending_after = count_pending_tweets()
+    update_state(
+        {
+            'status': 'idle',
+            'cycle_finished_at': finished_at,
+            'last_drained_at': finished_at if pending_after == 0 else None,
+            'last_cycle_total_analyzed': total_analyzed,
+            'last_cycle_batches': batches,
+            'pending_after_cycle': pending_after,
+        }
+    )
+    print(
+        f'[analytics] Cycle done. batches={batches} analyzed={total_analyzed} pending={pending_after}',
+        flush=True,
+    )
+    return total_analyzed

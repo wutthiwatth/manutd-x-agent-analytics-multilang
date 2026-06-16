@@ -3,7 +3,7 @@ import signal
 import sys
 import time
 
-from .analytics import run_analytics_once
+from .analytics import run_analytics_cycle
 from .config import config
 from .mongo import close_mongo
 
@@ -17,9 +17,20 @@ def handle_signal(signum, _frame):
     _shutdown = True
 
 
+def sleep_interruptible(seconds: int) -> None:
+    slept = 0
+    while slept < seconds and not _shutdown:
+        time.sleep(min(1, seconds - slept))
+        slept += 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Man Utd X analytics-only worker')
-    parser.add_argument('--once', action='store_true', help='Run one analytics batch and exit')
+    parser.add_argument(
+        '--once',
+        action='store_true',
+        help='Run one full drain cycle until no pending tweets, then exit',
+    )
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, handle_signal)
@@ -27,9 +38,9 @@ def main() -> int:
 
     try:
         try:
-            run_analytics_once()
+            run_analytics_cycle()
         except Exception as exc:
-            print(f'[analytics] First run failed: {exc}', file=sys.stderr, flush=True)
+            print(f'[analytics] First cycle failed: {exc}', file=sys.stderr, flush=True)
             if args.once:
                 return 1
 
@@ -37,21 +48,17 @@ def main() -> int:
             return 0
 
         interval_seconds = config.analytics_interval_minutes * 60
-        print(f'[analytics] Running every {config.analytics_interval_minutes} minute(s).', flush=True)
+        print(f'[analytics] Running drain cycle every {config.analytics_interval_minutes} minute(s).', flush=True)
 
         while not _shutdown:
-            slept = 0
-            while slept < interval_seconds and not _shutdown:
-                time.sleep(min(1, interval_seconds - slept))
-                slept += 1
-
+            sleep_interruptible(interval_seconds)
             if _shutdown:
                 break
 
             try:
-                run_analytics_once()
+                run_analytics_cycle()
             except Exception as exc:
-                print(f'[analytics] Run failed: {exc}', file=sys.stderr, flush=True)
+                print(f'[analytics] Cycle failed: {exc}', file=sys.stderr, flush=True)
 
         return 0
     finally:
